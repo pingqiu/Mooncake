@@ -9,7 +9,12 @@ backends: the master records an owner and the requesting client reads through
 that owner. Object storage is not a separate first-class replica type here.
 
 This document describes the OSS adapter implementation. Its signing protocol
-is OSS-specific; S3 requires a compatible adapter, not just a different endpoint.
+is OSS-specific. The request engine lives in `RestObjectStorageAdapter`, which
+`OssObjectStorageAdapter` and `S3ObjectStorageAdapter` both extend; each
+supplies only the protocol hooks. For S3 these are: AWS Signature V4 signing with `x-amz-*`
+headers and a signed `Host`, S3 canonical URIs for path-style and
+virtual-hosted addressing, `name=` for empty query values, and an unencoded
+ListObjectsV2 continuation token.
 
 For prerequisites, configuration, and startup examples, see
 [OSS Local-Disk Backend](../../deployment/oss-offload.md).
@@ -50,7 +55,8 @@ flowchart TB
 | Master | Schedule offload tasks and track completed `LOCAL_DISK` replicas and their owners. |
 | `FileStorage` | Obtain source slices, call the selected backend, report successful writes, and manage read staging buffers. |
 | `DistributedStorageBackend` | Convert `BatchOffload` / `BatchLoad` into object batches and check per-object results and read lengths. |
-| `OssObjectStorageAdapter` | Map keys, sign HTTP requests, run libcurl transfers, and implement GET/PUT/HEAD/LIST/DELETE. |
+| `RestObjectStorageAdapter` | Map keys, run libcurl transfers, and implement GET/PUT/HEAD/LIST/DELETE. |
+| `OssObjectStorageAdapter` | Read OSS configuration and sign requests with OSS V4. |
 | OSS | Store object payloads under the configured bucket and prefix. |
 
 One `FileStorage` instance selects one backend. Selecting OSS does not also
