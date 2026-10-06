@@ -9,7 +9,9 @@ backends: the master records an owner and the requesting client reads through
 that owner. Object storage is not a separate first-class replica type here.
 
 This document describes the OSS adapter implementation. Its signing protocol
-is OSS-specific; S3 requires a compatible adapter, not just a different endpoint.
+is OSS-specific. S3-compatible services use the separate S3 adapter
+(`S3ObjectStorageAdapter`, AWS Signature V4); see "S3-compatible services" in
+[OSS Local-Disk Backend](../../deployment/oss-offload.md).
 
 For prerequisites, configuration, and startup examples, see
 [OSS Local-Disk Backend](../../deployment/oss-offload.md).

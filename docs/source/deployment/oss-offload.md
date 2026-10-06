@@ -8,8 +8,9 @@ existing `FileStorage` offload path. As with local SSD and NVMe KV backends,
 the master records `LOCAL_DISK` replicas owned by a real client; readers still
 access the payload through that owner.
 
-The examples below use the OSS adapter. Other services require a compatible
-adapter; changing the endpoint alone does not add S3 support.
+The examples below use the OSS adapter. S3-compatible services (AWS S3,
+SeaweedFS, MinIO, Ceph RGW and others) use the S3 adapter, described under
+"S3-compatible services" in the Configuration section below.
 
 For implementation details, see [OSS Backend Design](../design/store/oss-backend.md).
 
@@ -124,6 +125,44 @@ suggestions, not TCP socket-buffer sizes or guaranteed throughput settings.
 The common offload heartbeat defaults to 10 seconds and is configured through
 `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS`. Other common client settings are
 described in [SSD Offload](ssd/ssd-offload.md).
+
+### S3-compatible services
+
+Set `MOONCAKE_DISTRIBUTED_FS_TYPE=s3` and configure the S3 adapter instead of
+the OSS variables. It uses the same build support, backend, namespace and
+concurrency behavior as the OSS adapter, and signs requests with AWS
+Signature V4.
+
+```bash
+export MOONCAKE_DISTRIBUTED_FS_TYPE=s3
+export MOONCAKE_S3_ENDPOINT=http://seaweedfs-s3:8333
+export MOONCAKE_S3_BUCKET=my-mooncake-bucket
+export MOONCAKE_S3_PATH_STYLE=true
+# Supply MOONCAKE_S3_ACCESS_KEY_ID and MOONCAKE_S3_SECRET_ACCESS_KEY
+# through your credential-management mechanism, not checked-in scripts.
+```
+
+| Environment variable | Default | Description |
+|----------------------|---------|-------------|
+| `MOONCAKE_S3_ENDPOINT` | Required | Endpoint starting with `http://` or `https://`, without a path. Alias: `AWS_ENDPOINT_URL`. |
+| `MOONCAKE_S3_BUCKET` | Required | Existing bucket. |
+| `MOONCAKE_S3_REGION` | `us-east-1` | Signing region. Falls back to `AWS_REGION`, then `AWS_DEFAULT_REGION`; a warning is logged when none is set. |
+| `MOONCAKE_S3_ACCESS_KEY_ID` | Required unless anonymous | Access key ID. Alias: `AWS_ACCESS_KEY_ID`. |
+| `MOONCAKE_S3_SECRET_ACCESS_KEY` | Required unless anonymous | Secret access key. Alias: `AWS_SECRET_ACCESS_KEY`. |
+| `MOONCAKE_S3_SESSION_TOKEN` | Empty | Optional session token. Alias: `AWS_SESSION_TOKEN`. |
+| `MOONCAKE_S3_PATH_STYLE` | `false` | Use `endpoint/bucket/key`. Most self-hosted services (SeaweedFS, MinIO) need `true`; it is forced on for IP-address and `localhost` endpoints. |
+| `MOONCAKE_S3_ANONYMOUS` | `false` | Disable signing; only for test endpoints or suitably configured public access. |
+| `MOONCAKE_S3_MAX_CONNECTIONS` | `64` | Same meaning and bounds as `MOONCAKE_OSS_MAX_CONNECTIONS`. |
+| `MOONCAKE_S3_RECEIVE_BUFFER_SIZE` | `1048576` (1 MiB) | Same meaning and bounds as `MOONCAKE_OSS_RECEIVE_BUFFER_SIZE`. |
+| `MOONCAKE_S3_UPLOAD_BUFFER_SIZE` | `1048576` (1 MiB) | Same meaning and bounds as `MOONCAKE_OSS_UPLOAD_BUFFER_SIZE`. |
+
+Credentials are read as one set: if `MOONCAKE_S3_ACCESS_KEY_ID` or
+`MOONCAKE_S3_SECRET_ACCESS_KEY` is set, the key ID, secret and session token
+all come from `MOONCAKE_S3_*`; otherwise all three come from `AWS_*`. An
+`AWS_SESSION_TOKEN` left in the environment is therefore never sent with
+`MOONCAKE_S3_*` keys. Other primary names take precedence over their `AWS_*`
+aliases. The adapter does not create buckets and does not refresh credentials. The payload is sent as
+`UNSIGNED-PAYLOAD`; use `https://` endpoints outside trusted networks.
 
 ## Start Mooncake
 

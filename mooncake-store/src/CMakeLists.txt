@@ -209,21 +209,29 @@ int main(int argc, char**) {
   endif()
 endif()
 
-# Alibaba Cloud OSS adapter (REST API with OSS V4 signing).
+# Alibaba Cloud OSS adapter (REST API with OSS V4 signing) and the S3-compatible
+# adapter (AWS Signature V4). The two adapters are independent.
 find_package(CURL QUIET)
 find_package(OpenSSL QUIET)
 if(CURL_FOUND AND OpenSSL_FOUND)
-  message(STATUS "Alibaba Cloud OSS adapter: Enabled")
+  message(STATUS "Alibaba Cloud OSS and S3 adapters: Enabled")
   set(MOONCAKE_OSS_ADAPTER_ENABLED
       TRUE
       CACHE INTERNAL "Whether the Alibaba Cloud OSS adapter is built")
-  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES config/oss_adapter_config.cpp
-       storage/distributed/oss_adapter.cpp)
+  list(
+    APPEND
+    MOONCAKE_STORE_CLIENT_SOURCES
+    storage/distributed/rest_object_storage_adapter.cpp
+    config/oss_adapter_config.cpp
+    storage/distributed/oss_adapter.cpp
+    config/s3_adapter_config.cpp
+    storage/distributed/s3_adapter.cpp)
   list(APPEND EXTRA_LIBS CURL::libcurl OpenSSL::Crypto)
   add_definitions(-DHAVE_OSS_ADAPTER)
 else()
   message(
-    STATUS "Alibaba Cloud OSS adapter: Disabled (requires CURL and OpenSSL)")
+    STATUS
+      "Alibaba Cloud OSS and S3 adapters: Disabled (requires CURL and OpenSSL)")
   set(MOONCAKE_OSS_ADAPTER_ENABLED
       FALSE
       CACHE INTERNAL "Whether the Alibaba Cloud OSS adapter is built")
