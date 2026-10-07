@@ -224,10 +224,24 @@ bool IsTransientStatus(long status) {
 
 // A GET whose error body does not fit the caller's buffer ends in a local
 // write error; the HTTP status then decides, so a 503 on a small object is
-// still retried.
-bool IsTransientFailure(CURLcode result, long status, bool overflow) {
+// still retried. A timeout is retried only while the connection was being set
+// up (TCP and TLS), before anything was sent: a request that had been sent
+// and then ran into the overall request timeout is not retried, so a stalled
+// server does not hold the caller for several request timeouts.
+bool IsTransientFailure(CURLcode result, long status, bool overflow,
+                        CURL* curl) {
     if (result == CURLE_OK || (result == CURLE_WRITE_ERROR && overflow)) {
         return IsTransientStatus(status);
+    }
+    if (result == CURLE_OPERATION_TIMEDOUT) {
+#if LIBCURL_VERSION_NUM >= 0x073d00  // CURLINFO_PRETRANSFER_TIME_T: 7.61.0.
+        curl_off_t pretransfer = 0;
+        curl_easy_getinfo(curl, CURLINFO_PRETRANSFER_TIME_T, &pretransfer);
+#else
+        double pretransfer = 0;
+        curl_easy_getinfo(curl, CURLINFO_PRETRANSFER_TIME, &pretransfer);
+#endif
+        return pretransfer == 0;
     }
     return IsTransientCurlError(result);
 }
@@ -478,8 +492,9 @@ RestObjectStorageAdapter::Request(
         const bool missing_object = method == "GET" && response.status == 404 &&
                                     result == CURLE_WRITE_ERROR &&
                                     context.download_context.overflow;
-        const bool transient = IsTransientFailure(
-            result, response.status, context.download_context.overflow);
+        const bool transient =
+            IsTransientFailure(result, response.status,
+                               context.download_context.overflow, context.curl);
         if (transient && attempt < kMaxAttempts) {
             LOG(WARNING) << LogName() << " " << method << " attempt " << attempt
                          << " failed ("
@@ -674,7 +689,8 @@ RestObjectStorageAdapter::RequestBatchOnce(
                     std::string(context->upload ? "PUT" : "GET") +
                     " failed: " + curl_easy_strerror(message->data.result);
                 if (IsTransientFailure(message->data.result, status,
-                                       context->download_context.overflow)) {
+                                       context->download_context.overflow,
+                                       context->curl)) {
                     transient_error[context->index] =
                         error + " (HTTP " + std::to_string(status) + ")";
                 } else {
