@@ -9,11 +9,16 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
+#include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/s3_adapter.h"
+#include "storage_backend.h"
 
 namespace mooncake {
 namespace {
@@ -46,6 +51,25 @@ class LiveCleanup {
 
    private:
     S3ObjectStorageAdapter& adapter_;
+};
+
+// Sets an environment variable for the lifetime of the object.
+class ScopedEnvVar {
+   public:
+    ScopedEnvVar(const char* name, const std::string& value) : name_(name) {
+        if (const char* old = std::getenv(name)) previous_ = old;
+        setenv(name, value.c_str(), 1);
+    }
+    ~ScopedEnvVar() {
+        if (previous_)
+            setenv(name_, previous_->c_str(), 1);
+        else
+            unsetenv(name_);
+    }
+
+   private:
+    const char* name_;
+    std::optional<std::string> previous_;
 };
 
 std::string Pattern(size_t size, int seed) {
@@ -170,6 +194,90 @@ TEST(S3ObjectStorageAdapterLiveTest, WrongSecretIsRejected) {
     auto put = adapter.Put("probe", {data.data(), data.size()});
     ASSERT_FALSE(put);
     EXPECT_EQ(put.error(), ErrorCode::FILE_WRITE_FAIL);
+}
+
+// Store-level round trip: the "s3" fs_adapter_type through the storage
+// backend factory, the object health check, multi-slice BatchOffload,
+// BatchLoad and IsExist, including an opaque logical key.
+TEST(S3ObjectStorageAdapterLiveTest, StorageBackendRoundTripsThroughFactory) {
+    if (!LiveEnabled()) GTEST_SKIP() << "Set MOONCAKE_RUN_LIVE_S3=1";
+    const std::string root = UniquePrefix("store");
+    ScopedEnvVar fs_type("MOONCAKE_DISTRIBUTED_FS_TYPE", "s3");
+    ScopedEnvVar root_dir("MOONCAKE_DISTRIBUTED_ROOT_DIR", root);
+    ScopedEnvVar health("MOONCAKE_DISTRIBUTED_HEALTH_CHECK", "true");
+    ScopedEnvVar buckets("MOONCAKE_DISTRIBUTED_HASH_BUCKET_COUNT", "4");
+
+    S3ObjectStorageAdapter cleanup_adapter(root);
+    ASSERT_TRUE(cleanup_adapter.Init());
+    LiveCleanup cleanup(cleanup_adapter);
+
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributed;
+    auto created = CreateStorageBackend(config);
+    ASSERT_TRUE(created);
+    auto backend =
+        std::dynamic_pointer_cast<DistributedStorageBackend>(*created);
+    ASSERT_NE(backend, nullptr);
+    EXPECT_TRUE(backend->UsesObjectStorage());
+    ASSERT_TRUE(backend->Init());
+
+    std::string opaque_key = "tenant";
+    opaque_key.push_back('\0');
+    opaque_key += "a/b%\\";
+    std::vector<std::string> keys;
+    for (int i = 0; i < 32; ++i) keys.push_back("kv/" + std::to_string(i));
+    keys.push_back(opaque_key);
+
+    std::map<std::string, std::pair<std::string, std::string>> parts;
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto& [head, tail_part] = parts[keys[i]];
+        head = Pattern(8192 + i * 97, static_cast<int>(i));
+        tail_part = Pattern(1024 + i, static_cast<int>(i) + 7);
+    }
+    for (auto& [key, value] : parts) {
+        batch[key] = {{value.first.data(), value.first.size()},
+                      {value.second.data(), value.second.size()}};
+    }
+
+    std::map<std::string, int64_t> completed;
+    auto offloaded = backend->BatchOffload(
+        batch, [&](const std::vector<std::string>& done,
+                   std::vector<StorageObjectMetadata>& metadata) {
+            for (size_t i = 0; i < done.size(); ++i)
+                completed[done[i]] = metadata[i].data_size;
+            return ErrorCode::OK;
+        });
+    ASSERT_TRUE(offloaded);
+    EXPECT_EQ(*offloaded, static_cast<int64_t>(keys.size()));
+    ASSERT_EQ(completed.size(), keys.size());
+    for (const auto& [key, value] : parts) {
+        EXPECT_EQ(completed.at(key), static_cast<int64_t>(value.first.size() +
+                                                          value.second.size()));
+    }
+    // The objects are in the bucket, seen through an independent adapter.
+    auto stored = cleanup_adapter.ListKeys();
+    ASSERT_TRUE(stored);
+    EXPECT_EQ(stored->size(), keys.size());
+
+    std::map<std::string, std::string> buffers;
+    std::unordered_map<std::string, Slice> load;
+    for (const auto& [key, value] : parts) {
+        auto& buffer = buffers[key];
+        buffer.assign(value.first.size() + value.second.size(), '\0');
+        load[key] = {buffer.data(), buffer.size()};
+    }
+    ASSERT_TRUE(backend->BatchLoad(load));
+    for (const auto& [key, value] : parts) {
+        EXPECT_EQ(buffers.at(key), value.first + value.second);
+    }
+
+    auto present = backend->IsExist(opaque_key);
+    ASSERT_TRUE(present);
+    EXPECT_TRUE(*present);
+    auto absent = backend->IsExist("kv/missing");
+    ASSERT_TRUE(absent);
+    EXPECT_FALSE(*absent);
 }
 
 }  // namespace
