@@ -120,8 +120,14 @@ class RestObjectStorageAdapter : public ObjectStorageAdapter {
         int upload_iovcnt = 0, void* download_buffer = nullptr,
         size_t download_capacity = 0) const;
 
+    // Runs the batch, then retries requests that failed transiently.
     std::vector<tl::expected<size_t, ErrorCode>> RequestBatch(
         const std::vector<BatchRequest>& requests);
+    // One pass over the batch. For each request, transient_error receives a
+    // description when it failed transiently and is empty otherwise.
+    std::vector<tl::expected<size_t, ErrorCode>> RequestBatchOnce(
+        const std::vector<BatchRequest>& requests,
+        std::vector<std::string>& transient_error);
 
     std::string LogicalToPhysicalKey(const std::string& logical_key) const;
     tl::expected<std::string, ErrorCode> PhysicalToLogicalKey(

@@ -15,6 +15,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -195,6 +196,52 @@ std::string ErrorSummary(std::string_view body) {
     return code + ": " + message.substr(0, 256);
 }
 
+// Attempts per request, counting the first. Transient failures are retried,
+// as the AWS SDKs do: connection set-up (a dropped SYN alone can take a
+// connect past its timeout), resets and timeouts, throttling and 5xx.
+constexpr int kMaxAttempts = 3;
+
+bool IsTransientCurlError(CURLcode code) {
+    switch (code) {
+        case CURLE_COULDNT_RESOLVE_HOST:
+        case CURLE_COULDNT_CONNECT:
+        case CURLE_OPERATION_TIMEDOUT:
+        case CURLE_SSL_CONNECT_ERROR:
+        case CURLE_SEND_ERROR:
+        case CURLE_RECV_ERROR:
+        case CURLE_GOT_NOTHING:
+        case CURLE_PARTIAL_FILE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool IsTransientStatus(long status) {
+    return status == 429 || status == 500 || status == 502 || status == 503 ||
+           status == 504;
+}
+
+// A GET whose error body does not fit the caller's buffer ends in a local
+// write error; the HTTP status then decides, so a 503 on a small object is
+// still retried.
+bool IsTransientFailure(CURLcode result, long status, bool overflow) {
+    if (result == CURLE_OK || (result == CURLE_WRITE_ERROR && overflow)) {
+        return IsTransientStatus(status);
+    }
+    return IsTransientCurlError(result);
+}
+
+// Sleeps before attempt 2, 3, ...: 100 ms, then 200 ms, each plus up to 50%
+// jitter so that a throttled batch does not retry in lockstep.
+void BackoffBeforeAttempt(int attempt) {
+    thread_local std::mt19937 rng{std::random_device{}()};
+    const int base_ms = 100 << (attempt - 2);
+    std::uniform_int_distribution<int> jitter(0, base_ms / 2);
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(base_ms + jitter(rng)));
+}
+
 }  // namespace
 
 struct RestObjectStorageAdapter::BatchRequest {
@@ -371,7 +418,7 @@ tl::expected<void, ErrorCode> RestObjectStorageAdapter::PrepareRequest(
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, DownloadCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &context.download_context);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 10000L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 120000L);
     if (method == "HEAD") curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
     if (method == "PUT") {
@@ -406,35 +453,54 @@ RestObjectStorageAdapter::Request(
     if (!initialized_) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    RequestContext context;
-    context.curl = curl_easy_init();
-    auto prepared = PrepareRequest(context, method, physical_key, query, body,
-                                   body_size, range, upload_iov, upload_iovcnt,
-                                   download_buffer, download_capacity);
-    if (!prepared) return tl::make_unexpected(prepared.error());
-    Response response;
-    curl_easy_setopt(context.curl, CURLOPT_HEADERFUNCTION, HeaderCallback);
-    curl_easy_setopt(context.curl, CURLOPT_HEADERDATA, &response.headers);
+    for (int attempt = 1;; ++attempt) {
+        if (attempt > 1) BackoffBeforeAttempt(attempt);
+        // Each attempt is signed and sent afresh; uploads restart from the
+        // first iovec and downloads from the start of the caller's buffer.
+        RequestContext context;
+        context.curl = curl_easy_init();
+        auto prepared = PrepareRequest(
+            context, method, physical_key, query, body, body_size, range,
+            upload_iov, upload_iovcnt, download_buffer, download_capacity);
+        if (!prepared) return tl::make_unexpected(prepared.error());
+        Response response;
+        curl_easy_setopt(context.curl, CURLOPT_HEADERFUNCTION, HeaderCallback);
+        curl_easy_setopt(context.curl, CURLOPT_HEADERDATA, &response.headers);
 
-    const CURLcode result = curl_easy_perform(context.curl);
-    curl_easy_getinfo(context.curl, CURLINFO_RESPONSE_CODE, &response.status);
-    response.transferred = context.download_context.transferred;
-    response.body = std::move(context.error_body);
-    // A 404 error body may exceed the caller's object buffer. Preserve the
-    // HTTP error only for this local abort, not for other transfer failures.
-    const bool missing_object = method == "GET" && response.status == 404 &&
-                                result == CURLE_WRITE_ERROR &&
-                                context.download_context.overflow;
-    if (result != CURLE_OK && !missing_object) {
-        LOG(ERROR) << LogName() << " " << method
-                   << " request failed: " << curl_easy_strerror(result);
-        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+        const CURLcode result = curl_easy_perform(context.curl);
+        curl_easy_getinfo(context.curl, CURLINFO_RESPONSE_CODE,
+                          &response.status);
+        response.transferred = context.download_context.transferred;
+        response.body = std::move(context.error_body);
+        // A 404 error body may exceed the caller's object buffer. Preserve the
+        // HTTP error only for this local abort, not for other transfer
+        // failures.
+        const bool missing_object = method == "GET" && response.status == 404 &&
+                                    result == CURLE_WRITE_ERROR &&
+                                    context.download_context.overflow;
+        const bool transient = IsTransientFailure(
+            result, response.status, context.download_context.overflow);
+        if (transient && attempt < kMaxAttempts) {
+            LOG(WARNING) << LogName() << " " << method << " attempt " << attempt
+                         << " failed ("
+                         << (result != CURLE_OK
+                                 ? std::string(curl_easy_strerror(result))
+                                 : "HTTP " + std::to_string(response.status))
+                         << "); retrying";
+            continue;
+        }
+        if (result != CURLE_OK && !missing_object) {
+            LOG(ERROR) << LogName() << " " << method
+                       << " request failed: " << curl_easy_strerror(result);
+            return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+        }
+        if (!IsSuccess(response.status) && response.status != 404) {
+            LOG(ERROR) << LogName() << " " << method << " returned HTTP "
+                       << response.status << ": "
+                       << ErrorSummary(response.body);
+        }
+        return response;
     }
-    if (!IsSuccess(response.status) && response.status != 404) {
-        LOG(ERROR) << LogName() << " " << method << " returned HTTP "
-                   << response.status << ": " << ErrorSummary(response.body);
-    }
-    return response;
 }
 
 tl::expected<void, ErrorCode> RestObjectStorageAdapter::Put(
@@ -463,6 +529,44 @@ tl::expected<void, ErrorCode> RestObjectStorageAdapter::PutV(
 std::vector<tl::expected<size_t, ErrorCode>>
 RestObjectStorageAdapter::RequestBatch(
     const std::vector<BatchRequest>& requests) {
+    std::vector<std::string> transient_error;
+    auto results = RequestBatchOnce(requests, transient_error);
+    for (int attempt = 2; attempt <= kMaxAttempts; ++attempt) {
+        std::vector<size_t> retry;
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (!results[i] && !transient_error[i].empty()) retry.push_back(i);
+        }
+        if (retry.empty()) break;
+        LOG(WARNING) << LogName() << " batch: retrying " << retry.size()
+                     << " of " << requests.size()
+                     << " requests after transient failures (attempt "
+                     << attempt << ", first: " << transient_error[retry[0]]
+                     << ")";
+        BackoffBeforeAttempt(attempt);
+        std::vector<BatchRequest> subset;
+        subset.reserve(retry.size());
+        for (size_t i : retry) subset.push_back(requests[i]);
+        std::vector<std::string> subset_error;
+        auto retried = RequestBatchOnce(subset, subset_error);
+        for (size_t j = 0; j < retry.size(); ++j) {
+            results[retry[j]] = std::move(retried[j]);
+            transient_error[retry[j]] = std::move(subset_error[j]);
+        }
+    }
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i] && !transient_error[i].empty()) {
+            LOG(ERROR) << LogName() << " batch request failed after "
+                       << kMaxAttempts << " attempts: " << transient_error[i];
+        }
+    }
+    return results;
+}
+
+std::vector<tl::expected<size_t, ErrorCode>>
+RestObjectStorageAdapter::RequestBatchOnce(
+    const std::vector<BatchRequest>& requests,
+    std::vector<std::string>& transient_error) {
+    transient_error.assign(requests.size(), std::string());
     std::vector<tl::expected<size_t, ErrorCode>> results;
     results.reserve(requests.size());
     for (size_t i = 0; i < requests.size(); ++i) {
@@ -566,9 +670,16 @@ RestObjectStorageAdapter::RequestBatch(
                 results[context->index] =
                     tl::make_unexpected(ErrorCode::FILE_NOT_FOUND);
             } else if (message->data.result != CURLE_OK) {
-                LOG(ERROR) << LogName() << " batch "
-                           << (context->upload ? "PUT" : "GET") << " failed: "
-                           << curl_easy_strerror(message->data.result);
+                const std::string error =
+                    std::string(context->upload ? "PUT" : "GET") +
+                    " failed: " + curl_easy_strerror(message->data.result);
+                if (IsTransientFailure(message->data.result, status,
+                                       context->download_context.overflow)) {
+                    transient_error[context->index] =
+                        error + " (HTTP " + std::to_string(status) + ")";
+                } else {
+                    LOG(ERROR) << LogName() << " batch " << error;
+                }
                 results[context->index] =
                     tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
             } else if (context->upload && IsSuccess(status)) {
@@ -578,9 +689,14 @@ RestObjectStorageAdapter::RequestBatch(
                            context->expected_size) {
                 results[context->index] = context->download_context.transferred;
             } else {
-                LOG(ERROR) << LogName() << " batch "
-                           << (context->upload ? "PUT" : "GET")
-                           << " returned HTTP " << status;
+                const std::string error =
+                    std::string(context->upload ? "PUT" : "GET") +
+                    " returned HTTP " + std::to_string(status);
+                if (IsTransientStatus(status)) {
+                    transient_error[context->index] = error;
+                } else {
+                    LOG(ERROR) << LogName() << " batch " << error;
+                }
                 results[context->index] = tl::make_unexpected(
                     context->upload ? ErrorCode::FILE_WRITE_FAIL
                                     : ErrorCode::FILE_READ_FAIL);

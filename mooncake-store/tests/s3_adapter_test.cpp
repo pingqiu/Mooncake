@@ -230,6 +230,22 @@ TEST(S3ObjectStorageAdapterTest, AnonymousRequestsCarryNoAuthorization) {
 }
 
 // Serves one scripted response per connection and records each request.
+constexpr char kCloseWithoutResponse[] = "<close>";
+
+std::string RawResponse(const std::string& status_line,
+                        const std::string& extra_headers,
+                        const std::string& body) {
+    return "HTTP/1.1 " + status_line + "\r\n" + extra_headers +
+           "Content-Length: " + std::to_string(body.size()) +
+           "\r\nConnection: close\r\n\r\n" + body;
+}
+
+std::string SlowDown() {
+    return RawResponse("503 Slow Down", "Content-Type: application/xml\r\n",
+                       "<Error><Code>SlowDown</Code><Message>Please reduce "
+                       "your request rate.</Message></Error>");
+}
+
 class OneShotHttpServer {
    public:
     explicit OneShotHttpServer(std::vector<std::string> bodies)
@@ -280,12 +296,19 @@ class OneShotHttpServer {
                 request.append(buffer.data(), static_cast<size_t>(received));
             }
             requests_.push_back(request);
-            const std::string response =
-                "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\n"
-                "Content-Length: " +
-                std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" +
-                body;
-            send(client, response.data(), response.size(), MSG_NOSIGNAL);
+            // kCloseWithoutResponse drops the connection; a body that starts
+            // with a status line is sent as the complete response; anything
+            // else is sent as a 200 XML body.
+            if (body != kCloseWithoutResponse) {
+                const std::string response =
+                    body.rfind("HTTP/1.1 ", 0) == 0
+                        ? body
+                        : "HTTP/1.1 200 OK\r\nContent-Type: "
+                          "application/xml\r\nContent-Length: " +
+                              std::to_string(body.size()) +
+                              "\r\nConnection: close\r\n\r\n" + body;
+                send(client, response.data(), response.size(), MSG_NOSIGNAL);
+            }
             close(client);
         }
     }
@@ -348,6 +371,89 @@ TEST(S3ObjectStorageAdapterTest, ListKeysSendsContinuationTokenUnchanged) {
             << request;
         EXPECT_NE(request.find("prefix=p%2F"), std::string::npos) << request;
     }
+}
+
+void ConfigureLocalEndpoint(ScopedEnvironment& env, uint16_t port) {
+    ClearS3Environment(env);
+    ConfigureCredentials(env);
+    env.Set("MOONCAKE_S3_ENDPOINT", "http://127.0.0.1:" + std::to_string(port));
+    env.Set("MOONCAKE_S3_BUCKET", "kv-bucket");
+    env.Set("MOONCAKE_S3_PATH_STYLE", "true");
+}
+
+// A throttled or failing service answers 503/5xx; the request is signed and
+// sent again rather than failing the caller.
+TEST(S3ObjectStorageAdapterTest, RetriesTransientStatusThenSucceeds) {
+    OneShotHttpServer server({SlowDown(), ListPage("p/only", false, "")});
+    ScopedEnvironment env;
+    ConfigureLocalEndpoint(env, server.port());
+    S3ObjectStorageAdapter adapter("p");
+    ASSERT_TRUE(adapter.Init());
+
+    auto keys = adapter.ListKeys();
+    ASSERT_TRUE(keys.has_value());
+    ASSERT_EQ(keys->size(), 1u);
+    EXPECT_EQ((*keys)[0].logical_key, "only");
+    EXPECT_EQ(server.requests().size(), 2u);
+}
+
+TEST(S3ObjectStorageAdapterTest, DoesNotRetryClientErrors) {
+    OneShotHttpServer server({RawResponse(
+        "403 Forbidden", "Content-Type: application/xml\r\n",
+        "<Error><Code>AccessDenied</Code><Message>denied</Message></Error>")});
+    ScopedEnvironment env;
+    ConfigureLocalEndpoint(env, server.port());
+    S3ObjectStorageAdapter adapter("p");
+    ASSERT_TRUE(adapter.Init());
+
+    EXPECT_FALSE(adapter.ListKeys().has_value());
+    EXPECT_EQ(server.requests().size(), 1u);
+}
+
+TEST(S3ObjectStorageAdapterTest, GivesUpAfterThreeAttempts) {
+    OneShotHttpServer server({SlowDown(), SlowDown(), SlowDown()});
+    ScopedEnvironment env;
+    ConfigureLocalEndpoint(env, server.port());
+    S3ObjectStorageAdapter adapter("p");
+    ASSERT_TRUE(adapter.Init());
+
+    EXPECT_FALSE(adapter.ListKeys().has_value());
+    EXPECT_EQ(server.requests().size(), 3u);
+}
+
+TEST(S3ObjectStorageAdapterTest, BatchGetRetriesTransientFailure) {
+    OneShotHttpServer server(
+        {SlowDown(), RawResponse("206 Partial Content",
+                                 "Content-Range: bytes 0-2/3\r\n", "abc")});
+    ScopedEnvironment env;
+    ConfigureLocalEndpoint(env, server.port());
+    S3ObjectStorageAdapter adapter("p");
+    ASSERT_TRUE(adapter.Init());
+
+    std::string buffer(3, '\0');
+    auto results = adapter.GetBatch({{"k", buffer.data(), buffer.size()}});
+    ASSERT_EQ(results.size(), 1u);
+    EXPECT_TRUE(results[0].has_value());
+    EXPECT_EQ(buffer, "abc");
+    EXPECT_EQ(server.requests().size(), 2u);
+}
+
+// A connection dropped before any response (for example a reset after a
+// stalled connect) is retried, and the upload is sent again from the start.
+TEST(S3ObjectStorageAdapterTest, BatchPutRetriesDroppedConnection) {
+    OneShotHttpServer server(
+        {kCloseWithoutResponse, RawResponse("200 OK", "", "")});
+    ScopedEnvironment env;
+    ConfigureLocalEndpoint(env, server.port());
+    S3ObjectStorageAdapter adapter("p");
+    ASSERT_TRUE(adapter.Init());
+
+    std::string payload = "payload";
+    iovec iov{payload.data(), payload.size()};
+    auto results = adapter.PutBatch({{"k", &iov, 1}});
+    ASSERT_EQ(results.size(), 1u);
+    EXPECT_TRUE(results[0].has_value());
+    EXPECT_EQ(server.requests().size(), 2u);
 }
 
 }  // namespace
